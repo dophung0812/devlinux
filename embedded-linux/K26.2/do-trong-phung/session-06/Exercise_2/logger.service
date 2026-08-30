@@ -1,0 +1,13 @@
+[Unit]
+Description=Logger Severity Test Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/logger
+StandardOutput=journal
+StandardError=journal
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

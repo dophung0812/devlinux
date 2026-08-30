@@ -1,0 +1,16 @@
+rm -f log.txt
+
+echo "=== 1. Full service log ===" >> log.txt
+journalctl -u logger.service >> log.txt
+
+echo "=== 2. Warning level and above ===" >> log.txt
+journalctl -u logger.service -p warning >> log.txt
+
+echo "=== 3. Error level and above ===" >> log.txt
+journalctl -u logger.service -p err >> log.txt
+
+echo "=== 4. Log from the last 1 minute ===" >> log.txt
+journalctl -u logger.service --since "1 minute ago" >> log.txt
+
+echo "=== 5. Crash point ===" >> log.txt
+journalctl -u logger.service -p err >> log.txt
