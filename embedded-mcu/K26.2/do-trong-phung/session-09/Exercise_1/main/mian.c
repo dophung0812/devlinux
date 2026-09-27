@@ -28,11 +28,13 @@
 #define LCD_PIN_RST      (14)
 #define LCD_PIN_BL       (2)
 
-#define ADC_UNIT_USED        ADC_UNIT_1
-#define ADC_CHANNEL_POT      ADC_CHANNEL_0
-#define ADC_PIN_POT          (1)
-#define ADC_ATTEN_USED       ADC_ATTEN_DB_12 /* Input range: suitable for the 0-3.3 V potentiometer swing. */
-#define ADC_BITWIDTH_USED    ADC_BITWIDTH_DEFAULT
+#define ADC_UNIT_USED   ADC_UNIT_1
+#define ADC_CHANNEL_POT ADC_CHANNEL_0
+#define ADC_PIN_POT     (1)
+#define ADC_ATTEN_USED                                                                                                 \
+    ADC_ATTEN_DB_12 /* ADC input range is approximately 0 to 3.1 V at 12 dB attenuation on ESP32-S3. */
+#define ADC_BITWIDTH_USED                                                                                              \
+    ADC_BITWIDTH_DEFAULT /* ESP32-S3 default ADC resolution is 12-bit, giving raw codes from 0 to 4095. */
 #define ADC_SAMPLE_COUNT     (16U)
 #define ADC_UPDATE_PERIOD_MS (200U)
 #define ADC_MAX_RAW          (4095U)
@@ -183,4 +185,177 @@ static void lcd_init(void)
     vTaskDelay(pdMS_TO_TICKS(20));
 }
 
-static void lcd_dr_
+static void lcd_draw_bar_outline(void)
+{
+    lcd_fill_rect(BAR_X, BAR_Y, BAR_MAX_W, BAR_H, COLOR_WHITE);
+
+    lcd_fill_rect(BAR_X + BAR_BORDER_W,
+                  BAR_Y + BAR_BORDER_W,
+                  BAR_MAX_W - 2 * BAR_BORDER_W,
+                  BAR_H - 2 * BAR_BORDER_W,
+                  COLOR_BLACK);
+}
+
+static void lcd_update_bar(uint16_t old_width, uint16_t new_width)
+{
+    if (new_width > old_width)
+    {
+        lcd_fill_rect(
+            BAR_X + old_width, BAR_Y + BAR_BORDER_W, new_width - old_width, BAR_H - 2 * BAR_BORDER_W, COLOR_BLUE);
+    }
+    else if (new_width < old_width)
+    {
+        lcd_fill_rect(
+            BAR_X + new_width, BAR_Y + BAR_BORDER_W, old_width - new_width, BAR_H - 2 * BAR_BORDER_W, COLOR_BLACK);
+    }
+}
+
+static void adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_config = {.unit_id = ADC_UNIT_USED, .ulp_mode = ADC_ULP_MODE_DISABLE};
+
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
+
+    adc_oneshot_chan_cfg_t channel_config = {.atten = ADC_ATTEN_USED, .bitwidth = ADC_BITWIDTH_USED};
+
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_POT, &channel_config));
+}
+
+static void adc_calibration_init(void)
+{
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_USED, .chan = ADC_CHANNEL_POT, .atten = ADC_ATTEN_USED, .bitwidth = ADC_BITWIDTH_USED};
+
+    esp_err_t ret = adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle);
+
+    if (ret == ESP_OK)
+    {
+        cali_enabled = true;
+        ESP_LOGI(TAG, "ADC curve fitting calibration enabled");
+    }
+    else
+    {
+        cali_enabled = false;
+        cali_handle = NULL;
+
+        ESP_LOGW(TAG, "ADC calibration unavailable: %s, using fallback", esp_err_to_name(ret));
+    }
+}
+
+static bool adc_read_average(int* raw_average)
+{
+    uint32_t raw_sum = 0;
+
+    for (uint32_t i = 0; i < ADC_SAMPLE_COUNT; i++)
+    {
+        int raw_value = 0;
+
+        esp_err_t ret = adc_oneshot_read(adc_handle, ADC_CHANNEL_POT, &raw_value);
+
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "ADC read failed: %s", esp_err_to_name(ret));
+
+            return false;
+        }
+
+        raw_sum += (uint32_t) raw_value;
+    }
+
+    *raw_average = (int) (raw_sum / ADC_SAMPLE_COUNT);
+
+    return true;
+}
+
+static int adc_raw_to_voltage(int raw_value)
+{
+    int voltage_mv = 0;
+
+    if (cali_enabled)
+    {
+        esp_err_t ret = adc_cali_raw_to_voltage(cali_handle, raw_value, &voltage_mv);
+
+        if (ret == ESP_OK)
+        {
+            return voltage_mv;
+        }
+
+        ESP_LOGW(TAG, "Calibration conversion failed: %s, using fallback", esp_err_to_name(ret));
+    }
+
+    voltage_mv = ((int64_t) raw_value * ADC_VOLTAGE_MAX_MV) / ADC_MAX_RAW;
+
+    return voltage_mv;
+}
+
+static uint16_t voltage_to_bar_width(int voltage_mv)
+{
+    uint32_t bar_width;
+
+    if (voltage_mv <= 0)
+    {
+        return 0;
+    }
+
+    if (voltage_mv >= ADC_VOLTAGE_MAX_MV)
+    {
+        return BAR_MAX_W;
+    }
+
+    bar_width = ((uint32_t) voltage_mv * BAR_MAX_W) / ADC_VOLTAGE_MAX_MV;
+
+    return (uint16_t) bar_width;
+}
+
+void app_main(void)
+{
+    uint16_t old_bar_width = 0;
+
+    lcd_init();
+
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, COLOR_BLACK);
+
+    lcd_draw_bar_outline();
+
+    adc_init();
+    adc_calibration_init();
+
+    ESP_LOGI(TAG, "ADC1 channel %d on GPIO%d", ADC_CHANNEL_POT, ADC_PIN_POT);
+
+    ESP_LOGI(TAG, "ADC sample count = %" PRIu32, ADC_SAMPLE_COUNT);
+
+    /* Record the real raw minimum and maximum measured on the potentiometer here after testing. */
+
+    while (1)
+    {
+        int raw_average = 0;
+        int voltage_mv = 0;
+        uint16_t new_bar_width = 0;
+
+        if (adc_read_average(&raw_average))
+        {
+            voltage_mv = adc_raw_to_voltage(raw_average);
+
+            if (voltage_mv < 0)
+            {
+                voltage_mv = 0;
+            }
+
+            if (voltage_mv > ADC_VOLTAGE_MAX_MV)
+            {
+                voltage_mv = ADC_VOLTAGE_MAX_MV;
+            }
+
+            new_bar_width = voltage_to_bar_width(voltage_mv);
+
+            ESP_LOGI(TAG, "raw=%4d -> %4d mV", raw_average, voltage_mv);
+
+            /* Only the changed strip is redrawn so the whole 480x320 screen is not repainted. */
+            lcd_update_bar(old_bar_width, new_bar_width);
+
+            old_bar_width = new_bar_width;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ADC_UPDATE_PERIOD_MS));
+    }
+}
