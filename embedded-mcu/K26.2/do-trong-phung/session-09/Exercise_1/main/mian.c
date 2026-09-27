@@ -1,12 +1,13 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_timer.h"
 
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -30,7 +31,7 @@
 #define ADC_UNIT_USED        ADC_UNIT_1
 #define ADC_CHANNEL_POT      ADC_CHANNEL_0
 #define ADC_PIN_POT          (1)
-#define ADC_ATTEN_USED       ADC_ATTEN_DB_12
+#define ADC_ATTEN_USED       ADC_ATTEN_DB_12 /* Input range: suitable for the 0-3.3 V potentiometer swing. */
 #define ADC_BITWIDTH_USED    ADC_BITWIDTH_DEFAULT
 #define ADC_SAMPLE_COUNT     (16U)
 #define ADC_UPDATE_PERIOD_MS (200U)
@@ -46,11 +47,11 @@
 #define COLOR_BLACK (0x0000U)
 #define COLOR_WHITE (0xFFFFU)
 #define COLOR_BLUE  (0x001FU)
-#define COLOR_GRAY  (0x8410U)
 
 static const char* TAG = "ADC";
-static spi_device_handle_t lcd_handle;
-static adc_oneshot_unit_handle_t adc_handle;
+
+static spi_device_handle_t lcd_handle = NULL;
+static adc_oneshot_unit_handle_t adc_handle = NULL;
 static adc_cali_handle_t cali_handle = NULL;
 static bool cali_enabled = false;
 
@@ -83,17 +84,21 @@ static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
     uint8_t data[4];
 
     lcd_write_cmd(0x2A);
+
     data[0] = x0 >> 8;
     data[1] = x0 & 0xFF;
     data[2] = x1 >> 8;
     data[3] = x1 & 0xFF;
+
     lcd_write_data(data, sizeof(data));
 
     lcd_write_cmd(0x2B);
+
     data[0] = y0 >> 8;
     data[1] = y0 & 0xFF;
     data[2] = y1 >> 8;
     data[3] = y1 & 0xFF;
+
     lcd_write_data(data, sizeof(data));
 
     lcd_write_cmd(0x2C);
@@ -102,7 +107,6 @@ static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 static void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t color)
 {
     static uint16_t line_buffer[LCD_WIDTH];
-    uint32_t pixel_count = (uint32_t) width * height;
 
     for (uint16_t i = 0; i < width; i++)
     {
@@ -115,8 +119,6 @@ static void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t heigh
     {
         lcd_write_data((const uint8_t*) line_buffer, width * 2);
     }
-
-    (void) pixel_count;
 }
 
 static void lcd_init(void)
@@ -132,6 +134,7 @@ static void lcd_init(void)
         .clock_speed_hz = LCD_SPI_CLOCK_HZ, .mode = 0, .spics_io_num = LCD_PIN_CS, .queue_size = 1};
 
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO));
+
     ESP_ERROR_CHECK(spi_bus_add_device(LCD_SPI_HOST, &device_config, &lcd_handle));
 
     gpio_config_t dc_config = {.pin_bit_mask = 1ULL << LCD_PIN_DC,
@@ -176,145 +179,8 @@ static void lcd_init(void)
 
     lcd_write_cmd(0x21);
     lcd_write_cmd(0x29);
+
     vTaskDelay(pdMS_TO_TICKS(20));
 }
 
-static void lcd_draw_bar_outline(void)
-{
-    lcd_fill_rect(BAR_X, BAR_Y, BAR_MAX_W, BAR_H, COLOR_WHITE);
-    lcd_fill_rect(BAR_X + BAR_BORDER_W,
-                  BAR_Y + BAR_BORDER_W,
-                  BAR_MAX_W - 2 * BAR_BORDER_W,
-                  BAR_H - 2 * BAR_BORDER_W,
-                  COLOR_BLACK);
-}
-
-static void lcd_update_bar(uint16_t old_width, uint16_t new_width)
-{
-    if (new_width > old_width)
-    {
-        lcd_fill_rect(
-            BAR_X + old_width, BAR_Y + BAR_BORDER_W, new_width - old_width, BAR_H - 2 * BAR_BORDER_W, COLOR_BLUE);
-    }
-    else if (new_width < old_width)
-    {
-        lcd_fill_rect(
-            BAR_X + new_width, BAR_Y + BAR_BORDER_W, old_width - new_width, BAR_H - 2 * BAR_BORDER_W, COLOR_BLACK);
-    }
-}
-
-static void adc_init(void)
-{
-    adc_oneshot_unit_init_cfg_t unit_config = {.unit_id = ADC_UNIT_USED};
-
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
-
-    adc_oneshot_chan_cfg_t channel_config = {.atten = ADC_ATTEN_USED, .bitwidth = ADC_BITWIDTH_USED};
-
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_POT, &channel_config));
-}
-
-static void adc_calibration_init(void)
-{
-    adc_cali_curve_fitting_config_t cali_config = {
-        .unit_id = ADC_UNIT_USED, .chan = ADC_CHANNEL_POT, .atten = ADC_ATTEN_USED, .bitwidth = ADC_BITWIDTH_USED};
-
-    esp_err_t ret = adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle);
-
-    if (ret == ESP_OK)
-    {
-        cali_enabled = true;
-        ESP_LOGI(TAG, "ADC calibration enabled");
-    }
-    else
-    {
-        cali_enabled = false;
-        ESP_LOGW(TAG, "ADC calibration unavailable: %s", esp_err_to_name(ret));
-    }
-}
-
-static bool adc_read_average(int* raw_average)
-{
-    int raw_value;
-    uint32_t raw_sum = 0;
-
-    for (uint32_t i = 0; i < ADC_SAMPLE_COUNT; i++)
-    {
-        esp_err_t ret = adc_oneshot_read(adc_handle, ADC_CHANNEL_POT, &raw_value);
-
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "ADC read failed: %s", esp_err_to_name(ret));
-            return false;
-        }
-
-        raw_sum += (uint32_t) raw_value;
-    }
-
-    *raw_average = (int) (raw_sum / ADC_SAMPLE_COUNT);
-
-    return true;
-}
-
-static int adc_raw_to_voltage(int raw_value)
-{
-    int voltage_mv = 0;
-
-    if (cali_enabled)
-    {
-        ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle, raw_value, &voltage_mv));
-    }
-    else
-    {
-        ESP_LOGW(TAG, "Calibration unavailable, voltage not calculated");
-    }
-
-    return voltage_mv;
-}
-
-void app_main(void)
-{
-    uint16_t old_bar_width = 0;
-
-    lcd_init();
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, COLOR_BLACK);
-    lcd_draw_bar_outline();
-
-    adc_init();
-    adc_calibration_init();
-
-    ESP_LOGI(TAG, "ADC pin = GPIO%d", ADC_PIN_POT);
-    ESP_LOGI(TAG, "ADC channel = %d", ADC_CHANNEL_POT);
-    ESP_LOGI(TAG, "ADC sample count = %" PRIu32, ADC_SAMPLE_COUNT);
-
-    while (1)
-    {
-        int raw_average = 0;
-        int voltage_mv = 0;
-        uint16_t new_bar_width = 0;
-
-        if (adc_read_average(&raw_average))
-        {
-            voltage_mv = adc_raw_to_voltage(raw_average);
-
-            if (voltage_mv < 0)
-            {
-                voltage_mv = 0;
-            }
-
-            if (voltage_mv > ADC_VOLTAGE_MAX_MV)
-            {
-                voltage_mv = ADC_VOLTAGE_MAX_MV;
-            }
-
-            new_bar_width = (uint16_t) (((uint32_t) voltage_mv * BAR_MAX_W) / ADC_VOLTAGE_MAX_MV);
-
-            ESP_LOGI(TAG, "raw=%4d -> %4d mV", raw_average, voltage_mv);
-
-            lcd_update_bar(old_bar_width, new_bar_width);
-            old_bar_width = new_bar_width;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(ADC_UPDATE_PERIOD_MS));
-    }
-}
+static void lcd_dr_
